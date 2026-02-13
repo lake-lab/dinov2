@@ -64,9 +64,17 @@ def is_sharded_fsdp(x):
 
 def free_if_fsdp(x):
     if is_sharded_fsdp(x):
-        handles = x._handles
-        true_list = [True for h in handles]
-        _reshard(x, handles, true_list)
+        # FSDP internals changed from `_handles` (multiple) to `_handle`
+        # (single) in newer torch releases.
+        handles = getattr(x, "_handles", None)
+        if handles is not None:
+            true_list = [True for _ in handles]
+            _reshard(x, handles, true_list)
+            return
+
+        handle = getattr(x, "_handle", None)
+        if handle is not None:
+            _reshard(x, handle, True)
 
 
 def get_fsdp_modules(x):

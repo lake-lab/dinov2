@@ -4,6 +4,37 @@
 
 :new: [2025-12-16] *Added Cell-DINO code following [Cell-DINO: Self-Supervised Image-based Embeddings for Cell Fluorescent Microscopy](to appear in Plos One Computational Biology), more details are [here](#dinov2-for-biology)*
 
+## Local H200 Training Notes (Princeton Della)
+
+This fork includes local updates for stable multi-GPU training/debugging on newer Della GPU nodes.
+
+### Code Modifications In This Fork
+
+- Updated environment targets to PyTorch 2.4.0 + CUDA 12.1 + xFormers 0.0.27 (`conda.yaml`, `conda-extras.yaml`, `requirements.txt`).
+- Added compatibility fixes for newer FSDP internals (handle/stream attributes) in `dinov2/fsdp/__init__.py` and `dinov2/train/ssl_meta_arch.py`.
+- Improved resume-equivalence for interrupted jobs in `dinov2/train/train.py`:
+  - checkpoints include optimizer + fp16 scaler + RNG state (Python/NumPy/Torch CPU/CUDA),
+  - dataloader resumption uses fixed seed and sampler advance from `start_iter`.
+- Added optional W&B logging integration in `dinov2/train/train.py` via environment variables (`WANDB_ENABLED`, `WANDB_*`).
+
+### How To Use `train_eval_vitl16_short_h200_8gpu.slurm`
+
+1. Ensure ImageNet is extracted in DINOv2 format:
+   - `${IMAGENET_ROOT}/train/<class>/*.JPEG`
+   - `${IMAGENET_ROOT}/val/<class>/*.JPEG`
+   - `${IMAGENET_ROOT}/labels.txt`
+2. Set paths and optional run names by exporting variables (or via `sbatch --export=...`):
+   - `REPO_DIR`, `IMAGENET_ROOT`, `IMAGENET_EXTRA`, `OUTPUT_DIR`, `RUN_NAME`
+3. Submit:
+   - `sbatch train_eval_vitl16_short_h200_8gpu.slurm`
+4. Monitor:
+   - `squeue -u $USER`
+   - `tail -f logs/dinov2_vitl16_short_h200_8gpu-<JOBID>.out`
+
+The script defaults to a 72h job with `--requeue` and timeout signal handling (`--signal=B:USR1@300`) so continuation is automatic if walltime is reached.
+
+W&B defaults to offline mode (`WANDB_MODE=offline`) and the script attempts `wandb sync` automatically at job end. If compute-node networking blocks direct upload, keep offline mode and sync later from a login node.
+
 [2025-08-14] *Please check out the more recent [DINOv3](https://github.com/facebookresearch/dinov3) effort continuing this line of work.*
 
 [2025-06-11] *Added dino.txt inference code, following [DINOv2 Meets Text: A Unified Framework for Image- and Pixel-Level Vision-Language Alignment](https://arxiv.org/abs/2412.16334).*

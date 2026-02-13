@@ -7,10 +7,13 @@ import argparse
 import logging
 import math
 import os
+import random
 from functools import partial
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
+import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, CellAugmentationDINO, MaskingGenerator
@@ -25,6 +28,68 @@ from dinov2.train.ssl_meta_arch import SSLMetaArch
 
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
 logger = logging.getLogger("dinov2")
+
+
+class RNGStateCheckpoint:
+    """Checkpointable wrapper for Python/NumPy/Torch RNG state."""
+
+    def state_dict(self):
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def load_state_dict(self, state):
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch_cpu" in state:
+            torch.set_rng_state(state["torch_cpu"])
+        if torch.cuda.is_available() and "torch_cuda_all" in state:
+            torch.cuda.set_rng_state_all(state["torch_cuda_all"])
+
+
+def maybe_init_wandb(cfg):
+    if os.environ.get("WANDB_ENABLED", "0") != "1":
+        return None
+    if not distributed.is_main_process():
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        logger.warning("WANDB_ENABLED=1 but 'wandb' is not installed. Continuing without W&B logging.")
+        return None
+
+    project = os.environ.get("WANDB_PROJECT", "dinov2")
+    entity = os.environ.get("WANDB_ENTITY") or None
+    run_name = os.environ.get("WANDB_RUN_NAME", os.path.basename(cfg.train.output_dir.rstrip("/")))
+    run_id = os.environ.get("WANDB_RUN_ID") or None
+    run_group = os.environ.get("WANDB_GROUP") or None
+    run_mode = os.environ.get("WANDB_MODE", "online")
+    run_tags_raw = os.environ.get("WANDB_TAGS", "")
+    run_tags = [x.strip() for x in run_tags_raw.split(",") if x.strip()]
+
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
+        id=run_id,
+        resume="allow",
+        group=run_group,
+        tags=run_tags if run_tags else None,
+        config=cfg_dict,
+        dir=cfg.train.output_dir,
+        mode=run_mode,
+    )
+    logger.info("W&B initialized: project=%s run=%s mode=%s", project, run_name, run_mode)
+    return wandb
 
 
 def get_args_parser(add_help: bool = True):
@@ -135,6 +200,8 @@ def do_train(cfg, model, resume=False):
     model.train()
     inputs_dtype = torch.half
     fp16_scaler = model.fp16_scaler  # for mixed precision training
+    wandb = maybe_init_wandb(cfg)
+    wandb_log_every = max(1, int(os.environ.get("WANDB_LOG_EVERY", "10")))
 
     # setup optimizer
 
@@ -147,8 +214,13 @@ def do_train(cfg, model, resume=False):
         last_layer_lr_schedule,
     ) = build_schedulers(cfg)
 
+    # checkpointables
+    checkpointables = {"optimizer": optimizer, "rng_state": RNGStateCheckpoint()}
+    if fp16_scaler is not None:
+        checkpointables["fp16_scaler"] = fp16_scaler
+
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, save_to_disk=True, **checkpointables)
 
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
@@ -212,9 +284,10 @@ def do_train(cfg, model, resume=False):
         batch_size=cfg.train.batch_size_per_gpu,
         num_workers=cfg.train.num_workers,
         shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
+        # Keep seed fixed and advance stream explicitly so resume matches uninterrupted training.
+        seed=cfg.train.seed,
         sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+        sampler_advance=start_iter * cfg.train.batch_size_per_gpu,
         drop_last=True,
         collate_fn=collate_fn,
     )
@@ -290,16 +363,34 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
         metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
+        if wandb is not None and (iteration + 1) % wandb_log_every == 0:
+            wandb.log(
+                {
+                    "train/iteration": iteration + 1,
+                    "train/lr": lr,
+                    "train/wd": wd,
+                    "train/momentum": mom,
+                    "train/last_layer_lr": last_layer_lr,
+                    "train/current_batch_size": current_batch_size,
+                    "train/total_loss": losses_reduced,
+                    **{f"train/{k}": v for k, v in loss_dict_reduced.items()},
+                },
+                step=iteration + 1,
+            )
 
         # checkpointing and testing
 
         if cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0:
             do_test(cfg, model, f"training_{iteration}")
+            if wandb is not None:
+                wandb.log({"train/teacher_checkpoint_iteration": iteration}, step=iteration + 1)
             torch.cuda.synchronize()
         periodic_checkpointer.step(iteration)
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
+    if wandb is not None:
+        wandb.finish()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 

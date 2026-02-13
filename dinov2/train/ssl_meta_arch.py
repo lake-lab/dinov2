@@ -348,9 +348,37 @@ class SSLMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = (
-                self.teacher.dino_head._streams
-            ) = self.student.backbone._streams = self.teacher.backbone._streams
+            fsdp_modules = [
+                self.teacher.backbone,
+                self.student.backbone,
+                self.teacher.dino_head,
+                self.student.dino_head,
+            ]
+            if hasattr(self.teacher, "ibot_head") and hasattr(self.student, "ibot_head"):
+                fsdp_modules.extend([self.teacher.ibot_head, self.student.ibot_head])
+
+            # Older torch FSDP used a single `_streams` container. Newer torch
+            # exposes per-stream attributes on the FSDP state.
+            if hasattr(self.teacher.backbone, "_streams"):
+                shared_streams = self.teacher.backbone._streams
+                for module in fsdp_modules:
+                    if hasattr(module, "_streams"):
+                        module._streams = shared_streams
+            else:
+                stream_attr_names = (
+                    "_default_stream",
+                    "_unshard_stream",
+                    "_post_backward_stream",
+                    "_pre_unshard_stream",
+                    "_all_reduce_stream",
+                )
+                for attr_name in stream_attr_names:
+                    if not hasattr(self.teacher.backbone, attr_name):
+                        continue
+                    shared_stream = getattr(self.teacher.backbone, attr_name)
+                    for module in fsdp_modules:
+                        if hasattr(module, attr_name):
+                            setattr(module, attr_name, shared_stream)
             self.need_to_synchronize_fsdp_streams = False
 
     def update_teacher(self, m):
