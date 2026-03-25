@@ -37,6 +37,39 @@ def write_config(cfg, output_dir, name="config.yaml"):
     return saved_cfg_path
 
 
+def maybe_preserve_scheduler_horizon(cfg, output_dir, resume=True):
+    saved_cfg_path = os.path.join(output_dir, "config.yaml")
+    requested_schedule_total_epochs = int(cfg.optim.get("schedule_total_epochs", 0) or 0)
+
+    if not resume or not os.path.isfile(saved_cfg_path):
+        if requested_schedule_total_epochs <= 0:
+            cfg.optim.schedule_total_epochs = int(cfg.optim.epochs)
+        return cfg
+
+    existing_cfg = OmegaConf.load(saved_cfg_path)
+    existing_schedule_total_epochs = int(
+        existing_cfg.optim.get("schedule_total_epochs", 0) or existing_cfg.optim.epochs
+    )
+
+    if requested_schedule_total_epochs <= 0:
+        cfg.optim.schedule_total_epochs = existing_schedule_total_epochs
+        logger.info(
+            "Preserving existing scheduler horizon on resume: optim.schedule_total_epochs=%d",
+            existing_schedule_total_epochs,
+        )
+        return cfg
+
+    if requested_schedule_total_epochs != existing_schedule_total_epochs:
+        logger.warning(
+            "Changing optim.schedule_total_epochs from existing=%d to requested=%d. "
+            "This will change the LR/WD/momentum schedule on resume.",
+            existing_schedule_total_epochs,
+            requested_schedule_total_epochs,
+        )
+
+    return cfg
+
+
 def get_cfg_from_args(args):
     args.output_dir = os.path.abspath(args.output_dir)
     args.opts += [f"train.output_dir={args.output_dir}"]
@@ -67,6 +100,7 @@ def setup(args):
     cfg = get_cfg_from_args(args)
     os.makedirs(args.output_dir, exist_ok=True)
     default_setup(args)
+    maybe_preserve_scheduler_horizon(cfg, args.output_dir, resume=not getattr(args, "no_resume", False))
     apply_scaling_rules_to_cfg(cfg)
     write_config(cfg, args.output_dir)
     return cfg

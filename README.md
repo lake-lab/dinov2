@@ -8,6 +8,9 @@
 
 This fork includes local updates for stable multi-GPU training/debugging on newer Della GPU nodes.
 
+SAYCam-specific training/eval runbook:
+- `docs/README_SAYCAM_TRAIN_EVAL.md`
+
 ### Code Modifications In This Fork
 
 - Updated environment targets to PyTorch 2.4.0 + CUDA 12.1 + xFormers 0.0.27 (`conda.yaml`, `conda-extras.yaml`, `requirements.txt`).

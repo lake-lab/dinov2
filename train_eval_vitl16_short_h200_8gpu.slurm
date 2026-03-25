@@ -17,6 +17,8 @@
 
 set -eo pipefail
 
+set +u
+export PS1="${PS1-}"
 module purge
 module load anaconda3/2025.6
 
@@ -24,7 +26,6 @@ ENV_NAME="${ENV_NAME:-dinov2}"
 
 # Some module/conda hook scripts reference unset vars (e.g. PS1/CONDA_BACKUP_*).
 # Keep nounset disabled during shell bootstrap, then re-enable for the workload.
-set +u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${ENV_NAME}"
 set -u
@@ -66,6 +67,8 @@ WANDB_MODE="${WANDB_MODE:-offline}"     # online | offline | disabled
 WANDB_LOG_EVERY="${WANDB_LOG_EVERY:-10}"
 WANDB_TAGS="${WANDB_TAGS:-h200,vitl16_short,8gpu}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-${REPO_DIR}/wandbkey}"
+WANDB_ENTITY_AUTO="${WANDB_ENTITY_AUTO:-1}"           # auto-detect entity from API key when empty
+WANDB_USE_PROXY_FOR_TRAIN="${WANDB_USE_PROXY_FOR_TRAIN:-1}"  # needed for WANDB_MODE=online on Della
 WANDB_SYNC_ENABLED="${WANDB_SYNC_ENABLED:-1}"         # for WANDB_MODE=offline
 WANDB_SYNC_USE_PROXY="${WANDB_SYNC_USE_PROXY:-1}"     # Princeton compute nodes need proxy/default
 WANDB_SYNC_TIMEOUT_SEC="${WANDB_SYNC_TIMEOUT_SEC:-240}"
@@ -98,6 +101,32 @@ export WANDB_ENABLED WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_RUN_ID WAND
 REQUEUE_REQUESTED=0
 TRAIN_STEP_PID=""
 
+detect_wandb_entity() {
+  if [[ "${WANDB_ENABLED}" != "1" || "${WANDB_ENTITY_AUTO}" != "1" || -n "${WANDB_ENTITY}" || -z "${WANDB_API_KEY:-}" ]]; then
+    return 0
+  fi
+  local detected_entity
+  detected_entity="$(
+    WANDB_API_KEY="${WANDB_API_KEY}" /home/cs1095/.conda/envs/dinov2/bin/python - <<'PY'
+import wandb
+try:
+    api = wandb.Api(timeout=20)
+    viewer = api.viewer
+    print(getattr(viewer, "entity", "") or getattr(viewer, "username", ""))
+except Exception:
+    pass
+PY
+  )"
+  detected_entity="$(echo "${detected_entity}" | tr -d '[:space:]')"
+  if [[ -n "${detected_entity}" ]]; then
+    WANDB_ENTITY="${detected_entity}"
+    export WANDB_ENTITY
+    echo "W&B entity auto-detected: ${WANDB_ENTITY}"
+  else
+    echo "[WARN] Could not auto-detect W&B entity. Set WANDB_ENTITY explicitly if sync fails with 403." >&2
+  fi
+}
+
 sync_wandb_offline() {
   if [[ "${WANDB_SYNC_ENABLED}" != "1" ]]; then
     echo "Skipping W&B sync because WANDB_SYNC_ENABLED=${WANDB_SYNC_ENABLED}"
@@ -116,6 +145,8 @@ sync_wandb_offline() {
     module load proxy/default >/dev/null 2>&1 || echo "[WARN] Failed to load proxy/default; sync may fail." >&2
   fi
 
+  detect_wandb_entity
+
   shopt -s nullglob
   local run_paths=("${OUTPUT_DIR}"/wandb/offline-run-*)
   shopt -u nullglob
@@ -125,7 +156,16 @@ sync_wandb_offline() {
   fi
 
   echo "Syncing ${#run_paths[@]} offline W&B run(s) from ${OUTPUT_DIR}/wandb ..."
-  if timeout "${WANDB_SYNC_TIMEOUT_SEC}" wandb sync --mark-synced "${run_paths[@]}"; then
+  local sync_cmd=(wandb sync --mark-synced)
+  if [[ -n "${WANDB_PROJECT}" ]]; then
+    sync_cmd+=(--project "${WANDB_PROJECT}")
+  fi
+  if [[ -n "${WANDB_ENTITY}" ]]; then
+    sync_cmd+=(--entity "${WANDB_ENTITY}")
+  fi
+  sync_cmd+=("${run_paths[@]}")
+
+  if timeout "${WANDB_SYNC_TIMEOUT_SEC}" "${sync_cmd[@]}"; then
     echo "W&B sync completed."
   else
     echo "[WARN] W&B sync did not complete cleanly (timeout or network issue)." >&2
@@ -161,6 +201,11 @@ handle_term() {
 
 trap handle_usr1 USR1
 trap handle_term TERM INT
+
+if [[ "${WANDB_ENABLED}" == "1" && "${WANDB_MODE}" == "online" && "${WANDB_USE_PROXY_FOR_TRAIN}" == "1" ]]; then
+  module load proxy/default >/dev/null 2>&1 || echo "[WARN] Failed to load proxy/default; W&B online mode may fail." >&2
+  detect_wandb_entity
+fi
 
 echo "=== CUDA COMPAT CHECK ==="
 python - <<'PY'
@@ -277,6 +322,8 @@ echo "WANDB_RUN_NAME=${WANDB_RUN_NAME}"
 echo "WANDB_RUN_ID=${WANDB_RUN_ID}"
 echo "WANDB_GROUP=${WANDB_GROUP}"
 echo "WANDB_MODE=${WANDB_MODE}"
+echo "WANDB_ENTITY_AUTO=${WANDB_ENTITY_AUTO}"
+echo "WANDB_USE_PROXY_FOR_TRAIN=${WANDB_USE_PROXY_FOR_TRAIN}"
 echo "WANDB_LOG_EVERY=${WANDB_LOG_EVERY}"
 echo "WANDB_TAGS=${WANDB_TAGS}"
 echo "WANDB_SYNC_ENABLED=${WANDB_SYNC_ENABLED}"
@@ -313,6 +360,8 @@ if [[ "${TRAIN_RC}" -ne 0 ]]; then
   sync_wandb_offline
   exit "${TRAIN_RC}"
 fi
+
+echo "[INFO] Training reached configured MAX_ITERS=${MAX_ITERS}; auto-requeue is only used when walltime timeout sends USR1."
 
 if [[ "${RUN_KNN_EVAL}" != "1" ]]; then
   echo "Skipping k-NN eval because RUN_KNN_EVAL=${RUN_KNN_EVAL}"

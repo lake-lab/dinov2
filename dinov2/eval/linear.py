@@ -159,7 +159,6 @@ def has_ddp_wrapper(m: nn.Module) -> bool:
 def remove_ddp_wrapper(m: nn.Module) -> nn.Module:
     return m.module if has_ddp_wrapper(m) else m
 
-
 def _pad_and_collate(batch):
     maxlen = max(len(targets) for image, targets in batch)
     padded_batch = [
@@ -256,6 +255,14 @@ def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, 
     return linear_classifiers, optim_param_groups
 
 
+def current_lr_from_optimizer(optimizer):
+    return optimizer.param_groups[0]["lr"]
+
+
+def step_scheduler(scheduler):
+    scheduler.step()
+
+
 @torch.no_grad()
 def evaluate_linear_classifiers(
     feature_model,
@@ -338,6 +345,7 @@ def eval_linear(
     logger.info("Starting training from iteration {}".format(start_iter))
     metric_logger = MetricLogger(delimiter="  ")
     header = "Training"
+    criterion = nn.CrossEntropyLoss()
 
     for data, labels in metric_logger.log_every(
         train_data_loader,
@@ -351,24 +359,20 @@ def eval_linear(
 
         features = feature_model(data)
         outputs = linear_classifiers(features)
-
-        losses = {f"loss_{k}": nn.CrossEntropyLoss()(v, labels) for k, v in outputs.items()}
+        losses = {f"loss_{k}": criterion(v, labels) for k, v in outputs.items()}
         loss = sum(losses.values())
 
-        # compute the gradients
         optimizer.zero_grad()
         loss.backward()
-
-        # step
         optimizer.step()
-        scheduler.step()
+        step_scheduler(scheduler)
 
         # log
         if iteration % 10 == 0:
             torch.cuda.synchronize()
             metric_logger.update(loss=loss.item())
-            metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-            print("lr", optimizer.param_groups[0]["lr"])
+            metric_logger.update(lr=current_lr_from_optimizer(optimizer))
+            print("lr", current_lr_from_optimizer(optimizer))
 
         if iteration - start_iter > 5:
             if iteration % running_checkpoint_period == 0:
@@ -514,8 +518,8 @@ def run_eval_linear(
         training_num_classes,
     )
 
-    optimizer = torch.optim.SGD(optim_param_groups, momentum=0.9, weight_decay=0)
     max_iter = epochs * epoch_length
+    optimizer = torch.optim.SGD(optim_param_groups, momentum=0.9, weight_decay=0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iter, eta_min=0)
     checkpointer = Checkpointer(linear_classifiers, output_dir, optimizer=optimizer, scheduler=scheduler)
     start_iter = checkpointer.resume_or_load(classifier_fpath or "", resume=resume).get("iteration", -1) + 1

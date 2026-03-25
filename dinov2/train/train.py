@@ -4,10 +4,13 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 import argparse
+import glob
 import logging
 import math
 import os
 import random
+import subprocess
+import sys
 from functools import partial
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
@@ -54,6 +57,20 @@ class RNGStateCheckpoint:
             torch.cuda.set_rng_state_all(state["torch_cuda_all"])
 
 
+class ArrayScheduler:
+    """Simple scheduler wrapper backed by an explicit schedule array."""
+
+    def __init__(self, schedule, final_value):
+        self.schedule = np.asarray(schedule, dtype=np.float64)
+        self.total_iters = len(self.schedule)
+        self.final_value = final_value
+
+    def __getitem__(self, it):
+        if it >= self.total_iters:
+            return self.final_value
+        return float(self.schedule[it])
+
+
 def maybe_init_wandb(cfg):
     if os.environ.get("WANDB_ENABLED", "0") != "1":
         return None
@@ -92,6 +109,39 @@ def maybe_init_wandb(cfg):
     return wandb
 
 
+def cleanup_stale_final_checkpoints(output_dir: str, start_iter: int, max_iter: int) -> None:
+    if start_iter >= max_iter:
+        return
+
+    checkpoint_markers = []
+    for path in sorted(glob.glob(os.path.join(output_dir, "last_checkpoint*"))):
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            checkpoint_markers.append(handle.read().strip())
+
+    if not checkpoint_markers:
+        return
+    if any(os.path.basename(path).startswith("model_final") for path in checkpoint_markers):
+        return
+
+    stale_paths = sorted(glob.glob(os.path.join(output_dir, "model_final*.pth")))
+    if not stale_paths:
+        return
+
+    if distributed.is_main_process():
+        logger.warning(
+            "Removing %d stale final checkpoint artifact(s) before resuming from iteration %d: %s",
+            len(stale_paths),
+            start_iter,
+            ", ".join(os.path.basename(path) for path in stale_paths),
+        )
+        for path in stale_paths:
+            os.remove(path)
+    if distributed.is_enabled():
+        torch.distributed.barrier()
+
+
 def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv2 training", add_help=add_help)
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
@@ -127,24 +177,76 @@ def build_optimizer(cfg, params_groups):
     return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
 
 
-def build_schedulers(cfg):
+def build_anchored_extension_scheduler(
+    *,
+    base_value,
+    final_value,
+    total_iters,
+    old_total_iters,
+    anchor_iter,
+    warmup_iters=0,
+    start_warmup_value=0,
+    freeze_iters=0,
+):
+    old_scheduler = CosineScheduler(
+        base_value=base_value,
+        final_value=final_value,
+        total_iters=old_total_iters,
+        warmup_iters=warmup_iters,
+        start_warmup_value=start_warmup_value,
+        freeze_iters=freeze_iters,
+    )
+
+    schedule = np.empty((total_iters,), dtype=np.float64)
+    prefix_end = min(max(anchor_iter, 0), total_iters)
+    for idx in range(prefix_end):
+        schedule[idx] = old_scheduler[idx]
+
+    if anchor_iter >= total_iters:
+        return ArrayScheduler(schedule=schedule, final_value=final_value)
+
+    anchor_value = old_scheduler[anchor_iter]
+    remaining = total_iters - anchor_iter
+    tail_iters = np.arange(remaining)
+    tail_schedule = final_value + 0.5 * (anchor_value - final_value) * (1 + np.cos(np.pi * tail_iters / len(tail_iters)))
+    schedule[anchor_iter:] = tail_schedule
+    return ArrayScheduler(schedule=schedule, final_value=final_value)
+
+
+def build_schedulers(cfg, start_iter=0):
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
+    schedule_total_epochs = int(getattr(cfg.optim, "schedule_total_epochs", 0) or cfg.optim["epochs"])
+    schedule_total_iters = schedule_total_epochs * OFFICIAL_EPOCH_LENGTH
+    resume_schedule_mode = str(getattr(cfg.optim, "resume_schedule_mode", "") or "").strip().lower()
+    resume_anchor_iteration = int(getattr(cfg.optim, "resume_anchor_iteration", -1))
+    resume_anchor_total_epochs = int(getattr(cfg.optim, "resume_anchor_total_epochs", 0) or 0)
+    if resume_anchor_iteration < 0:
+        resume_anchor_iteration = start_iter
+    resume_anchor_total_iters = resume_anchor_total_epochs * OFFICIAL_EPOCH_LENGTH
+    use_anchored_extension = (
+        resume_schedule_mode == "anchored_extension"
+        and start_iter > 0
+        and resume_anchor_total_iters > 0
+        and resume_anchor_total_iters < schedule_total_iters
+        and 0 <= resume_anchor_iteration < schedule_total_iters
+    )
+
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=schedule_total_iters,
         warmup_iters=cfg.optim["warmup_epochs"] * OFFICIAL_EPOCH_LENGTH,
         start_warmup_value=0,
     )
     wd = dict(
         base_value=cfg.optim["weight_decay"],
         final_value=cfg.optim["weight_decay_end"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=schedule_total_iters,
     )
     momentum = dict(
         base_value=cfg.teacher["momentum_teacher"],
         final_value=cfg.teacher["final_momentum_teacher"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
+        total_iters=schedule_total_iters,
     )
     teacher_temp = dict(
         base_value=cfg.teacher["teacher_temp"],
@@ -154,17 +256,56 @@ def build_schedulers(cfg):
         start_warmup_value=cfg.teacher["warmup_teacher_temp"],
     )
 
-    lr_schedule = CosineScheduler(**lr)
-    wd_schedule = CosineScheduler(**wd)
-    momentum_schedule = CosineScheduler(**momentum)
+    if use_anchored_extension:
+        lr_schedule = build_anchored_extension_scheduler(
+            old_total_iters=resume_anchor_total_iters,
+            anchor_iter=resume_anchor_iteration,
+            **lr,
+        )
+        wd_schedule = build_anchored_extension_scheduler(
+            old_total_iters=resume_anchor_total_iters,
+            anchor_iter=resume_anchor_iteration,
+            **wd,
+        )
+        momentum_schedule = build_anchored_extension_scheduler(
+            old_total_iters=resume_anchor_total_iters,
+            anchor_iter=resume_anchor_iteration,
+            **momentum,
+        )
+        last_layer_lr_schedule = build_anchored_extension_scheduler(
+            old_total_iters=resume_anchor_total_iters,
+            anchor_iter=resume_anchor_iteration,
+            **lr,
+        )
+        logger.info(
+            "Using anchored_extension scheduler: anchor_iter=%d old_total_iters=%d new_total_iters=%d "
+            "anchor_lr=%.8g anchor_wd=%.8g anchor_mom=%.8g",
+            resume_anchor_iteration,
+            resume_anchor_total_iters,
+            schedule_total_iters,
+            lr_schedule[resume_anchor_iteration],
+            wd_schedule[resume_anchor_iteration],
+            momentum_schedule[resume_anchor_iteration],
+        )
+    else:
+        lr_schedule = CosineScheduler(**lr)
+        wd_schedule = CosineScheduler(**wd)
+        momentum_schedule = CosineScheduler(**momentum)
+        last_layer_lr_schedule = CosineScheduler(**lr)
+
     teacher_temp_schedule = CosineScheduler(**teacher_temp)
-    last_layer_lr_schedule = CosineScheduler(**lr)
 
     last_layer_lr_schedule.schedule[
         : cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
     ] = 0  # mimicking the original schedules
 
-    logger.info("Schedulers ready.")
+    logger.info(
+        "Schedulers ready: train_total_epochs=%d schedule_total_epochs=%d schedule_total_iters=%d mode=%s",
+        int(cfg.optim["epochs"]),
+        schedule_total_epochs,
+        schedule_total_iters,
+        resume_schedule_mode or "default",
+    )
 
     return (
         lr_schedule,
@@ -196,6 +337,74 @@ def do_test(cfg, model, iteration):
         torch.save({"teacher": new_state_dict}, teacher_ckp_path)
 
 
+def maybe_auto_submit_mig_full10x(cfg, checkpoint_iteration: int) -> None:
+    if not distributed.is_main_process():
+        return
+
+    enabled = str(os.environ.get("AUTO_SUBMIT_MIG_FULL10X", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return
+
+    submissions_csv = str(os.environ.get("MIG_FULL10X_SUBMISSIONS_CSV", "")).strip()
+    if not submissions_csv:
+        logger.warning("AUTO_SUBMIT_MIG_FULL10X is enabled, but MIG_FULL10X_SUBMISSIONS_CSV is empty. Skipping.")
+        return
+
+    repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+    helper_script = os.path.join(repo_dir, "scripts", "submit_checkpoint_linear_mig_full10x_once.py")
+    config_path = os.path.join(cfg.train.output_dir, "config.yaml")
+    if not os.path.isfile(helper_script):
+        logger.warning("Missing auto-submit helper script: %s", helper_script)
+        return
+    if not os.path.isfile(config_path):
+        logger.warning("Missing config for auto-submit helper: %s", config_path)
+        return
+
+    helper_cmd = [
+        sys.executable,
+        helper_script,
+        "--train-output-dir",
+        cfg.train.output_dir,
+        "--checkpoint-iteration",
+        str(checkpoint_iteration),
+        "--config-file",
+        config_path,
+        "--submissions-csv",
+        submissions_csv,
+    ]
+    job_tag = str(os.environ.get("MIG_FULL10X_JOB_TAG", "")).strip()
+    if job_tag:
+        helper_cmd.extend(["--job-tag", job_tag])
+    marker_filename = str(os.environ.get("MIG_FULL10X_MARKER_FILENAME", "")).strip()
+    if marker_filename:
+        helper_cmd.extend(["--marker-filename", marker_filename])
+
+    try:
+        completed = subprocess.run(helper_cmd, capture_output=True, text=True, check=False, cwd=repo_dir)
+    except Exception:
+        logger.warning("Auto MIG full10x submit raised unexpectedly for checkpoint %d", checkpoint_iteration, exc_info=True)
+        return
+
+    if completed.stdout.strip():
+        logger.info(
+            "Auto MIG full10x submit stdout for checkpoint %d:\n%s",
+            checkpoint_iteration,
+            completed.stdout.strip(),
+        )
+    if completed.stderr.strip():
+        logger.warning(
+            "Auto MIG full10x submit stderr for checkpoint %d:\n%s",
+            checkpoint_iteration,
+            completed.stderr.strip(),
+        )
+    if completed.returncode != 0:
+        logger.warning(
+            "Auto MIG full10x submit failed for checkpoint %d with exit code %d",
+            checkpoint_iteration,
+            completed.returncode,
+        )
+
+
 def do_train(cfg, model, resume=False):
     model.train()
     inputs_dtype = torch.half
@@ -206,14 +415,6 @@ def do_train(cfg, model, resume=False):
     # setup optimizer
 
     optimizer = build_optimizer(cfg, model.get_params_groups())
-    (
-        lr_schedule,
-        wd_schedule,
-        momentum_schedule,
-        teacher_temp_schedule,
-        last_layer_lr_schedule,
-    ) = build_schedulers(cfg)
-
     # checkpointables
     checkpointables = {"optimizer": optimizer, "rng_state": RNGStateCheckpoint()}
     if fp16_scaler is not None:
@@ -224,15 +425,29 @@ def do_train(cfg, model, resume=False):
 
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
+    (
+        lr_schedule,
+        wd_schedule,
+        momentum_schedule,
+        teacher_temp_schedule,
+        last_layer_lr_schedule,
+    ) = build_schedulers(cfg, start_iter=start_iter)
+
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    cleanup_stale_final_checkpoints(cfg.train.output_dir, start_iter, max_iter)
+
+    checkpoint_period_iters = int(getattr(cfg.train, "saveckp_freq_iterations", 0) or 0)
+    if checkpoint_period_iters <= 0:
+        checkpoint_period_iters = 3 * OFFICIAL_EPOCH_LENGTH
 
     periodic_checkpointer = PeriodicCheckpointer(
         checkpointer,
-        period=3 * OFFICIAL_EPOCH_LENGTH,
+        period=checkpoint_period_iters,
         max_iter=max_iter,
         max_to_keep=3,
     )
+    logger.info("Checkpoint period (iterations): %d", checkpoint_period_iters)
 
     # setup data preprocessing
 
@@ -382,6 +597,7 @@ def do_train(cfg, model, resume=False):
 
         if cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0:
             do_test(cfg, model, f"training_{iteration}")
+            maybe_auto_submit_mig_full10x(cfg, iteration)
             if wandb is not None:
                 wandb.log({"train/teacher_checkpoint_iteration": iteration}, step=iteration + 1)
             torch.cuda.synchronize()

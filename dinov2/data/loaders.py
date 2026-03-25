@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ImageNet, ImageNet22k, HPAone, HPAFoV, CHAMMI_CP, CHAMMI_HPA, CHAMMI_WTC
+from .datasets import ImageNet, ImageNet22k, SAYCam, HPAone, HPAFoV, CHAMMI_CP, CHAMMI_HPA, CHAMMI_WTC
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 
@@ -48,8 +48,8 @@ def _parse_dataset_str(dataset_str: str):
     kwargs = {}
 
     for token in tokens[1:]:
-        key, value = token.split("=")
-        assert key in ("root", "extra", "split", "mode", "wildcard")
+        key, value = token.split("=", 1)
+        assert key in ("root", "extra", "split", "mode", "wildcard", "manifest")
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -58,6 +58,8 @@ def _parse_dataset_str(dataset_str: str):
             kwargs["split"] = ImageNet.Split[kwargs["split"]]
     elif name == "ImageNet22k":
         class_ = ImageNet22k
+    elif name == "SAYCam":
+        class_ = SAYCam
     elif name == "HPAone":
         class_ = HPAone
     elif name == "HPAFoV":

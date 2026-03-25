@@ -63,6 +63,7 @@ train:
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
   saveckp_freq: 20
+  saveckp_freq_iterations: 0
   seed: 0
   num_workers: 10
   OFFICIAL_EPOCH_LENGTH: 1250
@@ -96,6 +97,10 @@ teacher:
   channel_adaptive: false
 optim:
   epochs: 100
+  schedule_total_epochs: 0  # 0 means "use optim.epochs"; resumes preserve the previous scheduler horizon
+  resume_schedule_mode: ""  # set explicitly for non-equivalent late-extension policies
+  resume_anchor_iteration: -1  # iteration whose schedule value should be matched when resuming with a new policy
+  resume_anchor_total_epochs: 0  # scheduler horizon used to compute the anchor value
   weight_decay: 0.04
   weight_decay_end: 0.4
   base_lr: 0.004  # learning rate for a batch size of 1024
